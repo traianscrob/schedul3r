@@ -1,3 +1,4 @@
+use core::cell::UnsafeCell;
 use std::ops::Deref;
 use std::env::Args;
 use chrono::{DateTime, Duration, Local};
@@ -10,16 +11,14 @@ use crossbeam_utils::thread as other_thread;
 
 //types
 type TimerCallback = dyn FnMut() + Send + Sync + 'static;
-type ExecutionResultParam = Box<dyn IExecutionResult<()> + Send + 'static + Sync>;
+type ExecutionResultParam = Box<dyn IExecutionResult<()> + Send + 'static + Sync >;
 
 //traits
-pub trait Function{
-    fn execute(&self);
-}
-
 pub trait Job{
     fn execute();
 }
+
+//trait TimerCallback: FnMut() + Send + Sync + 'static + Copy + Sized { }
 
 trait IExecutionResult<T: ?Sized>{
     fn get_start_time(&self) -> DateTime<Local>;
@@ -42,6 +41,14 @@ pub struct JobItem{
     next_run: DateTime<Local>
 }
 
+pub struct JobScheduler{
+    _timers: dict::Dict<Arc<Mutex<JobTimer>>>,
+    _handles: Vec<std::thread::JoinHandle<()>>
+}
+
+#[derive(Copy, Clone)]
+struct Callback {}
+
 #[derive(Copy)]
 struct ExecutionResult{
     start_time: DateTime<Local>,
@@ -61,26 +68,9 @@ struct JobTimer{
     last_run: Option<DateTime<Local>>
 }
 
-pub struct JobScheduler{
-    _timers: dict::Dict<JobTimer>,
-    _handles: Vec<std::thread::JoinHandle<()>>
-}
-
 pub struct ScheduleManager{ }
 
 //implementation
-impl Function for dyn FnMut()  + Send + Sync + 'static{
-    fn execute(&self) {
-        
-    }
-}
-
-impl<F: ?Sized> Function for Box<F> where F: Function{ 
-    fn execute(&self) {
-        (**self).execute()
-    }
-}
-
 impl JobItem{
     pub fn name(&self) -> String {
         self.name.clone()
@@ -194,14 +184,14 @@ impl JobTimer{
     }
 
     fn schedule_job<F: FnMut(ExecutionResultParam) + Send + 'static + Sync,
-                        C: FnMut() + Send + 'static + Sync>(&mut self, mut callback: C, after_execute: &mut F){
+                    C: FnMut() + Send + 'static + Sync>(cron_expression: &'static str, mut callback: C, after_execute: &mut F){
             let _ = other_thread::scope(|scope| {
                 let (_sender, _receiver) = channel::<Box<dyn IExecutionResult<()> + Send + 'static + Sync>>();
                 let _sender = Arc::new(Mutex::new(_sender));
                 let _receiver = Arc::new(Mutex::new(_receiver));
     
                 let _j1 = scope.spawn(move |_| {
-                    let cron_exp = ChronExpression::parse(self.cron_expression.clone());
+                    let cron_exp = ChronExpression::parse(cron_expression.clone());
                     let _timer = Timer::new();
                     let (tx, rx) = channel();
                     let _guard = _timer.schedule(cron_exp.next(), cron_exp.duration(), move || {
@@ -295,7 +285,7 @@ impl JobTimer{
 impl JobScheduler{
     pub fn new() -> Self{
         Self{
-            _timers: Dict::<JobTimer>::new(),
+            _timers: Dict::<Arc<Mutex<JobTimer>>>::new(),
             _handles: vec![]
         }
     }
@@ -304,42 +294,49 @@ impl JobScheduler{
         let mut vector = Vec::<JobItem>::new();
 
         for elem in self._timers.iter() {
+            let value = elem.val.lock().unwrap();
+
             vector.push(JobItem{
                 name: elem.key.clone(),
-                is_cancelling: elem.val.is_cancelling,
-                run_successfuly: elem.val.run_successfuly,
-                is_running: elem.val.is_running,
-                last_run: elem.val.last_run,
-                next_run: elem.val.next_run(),
+                is_cancelling: value.is_cancelling,
+                run_successfuly: value.run_successfuly,
+                is_running: value.is_running,
+                last_run: value.last_run,
+                next_run: value.next_run(),
             });
         }
 
         vector
     }
 
-    fn private_schedule<F: FnMut() + Send + 'static + Sync + Copy>(&mut self, name: &'static str, cron_expression: &'static str, callback: F) -> Result<bool, String>{
+    fn private_schedule<F: FnMut() + Send + Sync + 'static + Copy>(&mut self, name: &'static str, cron_expression: &'static str, callback: F) -> Result<bool, String>{
         if self._timers.contains_key(name) {
             return Err(format!("There's already a job named: {name}!", name = name));
         }
 
-        let job = JobTimer::new(cron_expression, Box::new(callback));
+        self._timers.add(String::from(name), Arc::new(Mutex::new(JobTimer::new(cron_expression, Box::new(callback)))));
 
-        self._timers.add(String::from(name), job);
-        self._handles.push(thread::spawn(move ||
-            job.schedule_job(callback, &mut |data: ExecutionResultParam|{
+        let _handler = thread::spawn(move || {
+            JobTimer::schedule_job(cron_expression, callback, &mut |data: ExecutionResultParam|{
                 let values: &dyn IExecutionResult<()> = &*data;
-        })));
+                //job.update_job(values);
+            });
+        });
+        
+        self._handles.push(_handler);
         
         Ok(true)
     }
 
     pub fn schedule<J: Job>(&mut self, cron_expression: &'static str) -> Result<bool, String>{
-        let callback : Box<TimerCallback> = Box::new(|| J::execute());
-        self.private_schedule(type_name::<J>(), cron_expression, callback)
+        self.private_schedule(type_name::<J>(), cron_expression, || J::execute())
     }
 
-    pub fn schedule_with_callback<F: FnMut() + Send + Sync + 'static>(&mut self, name: &'static str, cron_expression: &'static str, callback: F) -> Result<bool, String>{
-        self.private_schedule(name, cron_expression, Box::new(callback))
+    pub fn schedule_with_callback<F: FnMut() + Send + Sync + 'static + std::marker::Copy>(&mut self,
+        name: &'static str,
+        cron_expression: &'static str,
+        callback: F) -> Result<bool, String>{
+        self.private_schedule(name, cron_expression, callback)
     }
 
     pub fn trigger<J: Job>(&mut self) -> Option<bool>{
@@ -348,7 +345,8 @@ impl JobScheduler{
         if self._timers.contains_key(name) {
             for elem in self._timers.iter_mut() {
                 if elem.key == String::from(name) {
-                    return Some(elem.val.trigger().unwrap())
+                    let mut value = elem.val.lock().unwrap();
+                    return Some(value.trigger().unwrap())
                 }
             }
         }
@@ -402,14 +400,15 @@ mod tests {
 
     #[test]
     fn scheduler_works() {
-        let mut test = TestCall::default();
-        let mut scheduler = ScheduleManager::instance();
-
         
+        let mut scheduler = ScheduleManager::instance();
+        let mut test = TestCall::default();
 
-        let _job1 = scheduler.schedule_with_callback("test", "*/1 * * * *", || test.increment());
+        let _job1 = scheduler.schedule_with_callback("test", "*/1 * * * *", move || {
+            test.increment();
+        });
 
-        std::thread::sleep(std::time::Duration::from_secs(70));
+        std::thread::sleep(std::time::Duration::from_secs(70));       
 
         assert_eq!(1, test.get_calls());
     }
