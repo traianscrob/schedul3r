@@ -1,0 +1,16 @@
+[package]
+name = "schedul3r"
+version = "0.1.0"
+authors = ["traian05 <traianscrob@yahoo.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+chrono = "0.4"
+delegate = "0.5.1"
+dict = "0.1.5"
+cron-parser = "0.7.9"
+timespan = "^0"
+timer = "0.2.0"
+crossbeam-utils = "0.8.4"
