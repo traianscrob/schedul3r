@@ -1,6 +1,3 @@
-use core::cell::UnsafeCell;
-use std::ops::Deref;
-use std::env::Args;
 use chrono::{DateTime, Duration, Local};
 use std::sync::{Arc, Mutex};
 use timer::Timer;
@@ -17,8 +14,6 @@ type ExecutionResultParam = Box<dyn IExecutionResult<()> + Send + 'static + Sync
 pub trait Job{
     fn execute();
 }
-
-//trait TimerCallback: FnMut() + Send + Sync + 'static + Copy + Sized { }
 
 trait IExecutionResult<T: ?Sized>{
     fn get_start_time(&self) -> DateTime<Local>;
@@ -246,20 +241,20 @@ impl JobTimer{
         self.last_run = Some(Local::now());
     }
 
-    pub fn trigger(&mut self) -> Option<bool>{
+    pub fn trigger(&mut self){
         self.is_running = true;
         self.is_cancelling = false;
         self.start_time = Some(Local::now());
 
         self.start();
 
-        other_thread::scope(|scope| {
+        other_thread::scope(|scope|{
+            let callback = Arc::new(&self.callback);
             scope.spawn(move |_| {
-                (self.callback)();
-            }).join();
+                let callback = callback.clone();
+                //callback.deref();
+            });
         });
-
-        Some(true)
     }
 
     pub fn next_run(&self) -> DateTime<Local>{
@@ -339,19 +334,17 @@ impl JobScheduler{
         self.private_schedule(name, cron_expression, callback)
     }
 
-    pub fn trigger<J: Job>(&mut self) -> Option<bool>{
+    pub fn trigger<J: Job>(&mut self){
         let name = type_name::<J>();
 
         if self._timers.contains_key(name) {
             for elem in self._timers.iter_mut() {
                 if elem.key == String::from(name) {
                     let mut value = elem.val.lock().unwrap();
-                    return Some(value.trigger().unwrap())
+                    value.trigger();
                 }
             }
         }
-
-        None
     }
 
     pub fn cancel<J: Job>(&mut self) -> Option<bool>{
@@ -379,11 +372,11 @@ mod tests {
     }
 
     impl TestCall{
-        fn increment(&mut self){
-            self.calls+=1;
+        pub fn increment(&mut self){
+            self.calls = self.calls + 1;
         }
 
-        fn get_calls(&self) -> i16{
+        pub fn get_calls(&self) -> i16{
             self.calls
         }
     }
@@ -400,15 +393,16 @@ mod tests {
 
     #[test]
     fn scheduler_works() {
-        
         let mut scheduler = ScheduleManager::instance();
-        let mut test = TestCall::default();
+        let mut test = TestCall{calls:0};
 
         let _job1 = scheduler.schedule_with_callback("test", "*/1 * * * *", move || {
             test.increment();
+
+            println!("You win!");
         });
 
-        std::thread::sleep(std::time::Duration::from_secs(70));       
+        std::thread::sleep(std::time::Duration::from_secs(61));     
 
         assert_eq!(1, test.get_calls());
     }
