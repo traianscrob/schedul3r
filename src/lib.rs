@@ -319,11 +319,9 @@ mod tests {
             }
         }
 
-        fn increment(&mut self){
+        fn increment(&mut self) -> i16 {
             self.calls += 1;
-        }
 
-        fn get_calls(&mut self) -> i16{
             self.calls
         }
     }
@@ -350,12 +348,7 @@ mod tests {
 
         let _job1 = scheduler.schedule_with_callback("test", "*/1 * * * *", move || { }, Some(callback));
         let _job2 = scheduler.execute(move || {
-            TestCall::increment(&mut test);
-            println!("You win!");
+            assert_eq!(test.increment(), 1);
         });
-
-        std::thread::sleep(std::time::Duration::from_secs(2));    
-
-        assert_eq!(TestCall::get_calls(&mut test), 1);
     }
 }
