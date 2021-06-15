@@ -8,10 +8,9 @@ edition = "2018"
 
 [dependencies]
 chrono = "0.4"
-delegate = "0.5.1"
 dict = "0.1.5"
 cron-parser = "0.7.9"
 timespan = "^0"
 timer = "0.2.0"
 crossbeam-utils = "0.8.4"
-traitcast = ""
+configparser = ""

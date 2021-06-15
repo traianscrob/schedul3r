@@ -5,9 +5,10 @@ use std::sync::mpsc::channel;
 use std::{any::type_name, thread};
 use dict::{ Dict, DictIface };
 use crossbeam_utils::thread as other_thread;
+use configparser::ini::Ini;
+use std::error::Error;
 
 //types
-pub type Callback = dyn IExecutionResult<()> + Send + 'static + Sync;
 type TimerCallback = dyn FnMut() + Send + Sync + 'static;
 
 //traits
@@ -154,7 +155,8 @@ impl Clone for AfterExecutionResult{
 }
 
 impl JobTimer<'static>{
-    pub fn new(name: &'static str, cron_expression: &'static str, function: Box<TimerCallback>, callback: Option<Box<dyn FnMut(Box<AfterExecutionResult>) + Send + Sync + 'static>>) -> Self{
+    pub fn new(name: &'static str, cron_expression: &'static str, function: Box<TimerCallback>,
+        callback: Option<Box<dyn FnMut(Box<AfterExecutionResult>) + Send + Sync + 'static>>) -> Self{
         let mut obj = Self {
             name: name,
             cron_expression: cron_expression.clone(),
@@ -175,9 +177,10 @@ impl JobTimer<'static>{
         obj
     }
 
-    fn schedule<F: FnMut(Box<AfterExecutionResult>) + Send + 'static + Sync>(name: &'static str, cron_expression: &'static str,
+    fn schedule<Func: FnMut(Box<AfterExecutionResult>) + Send + 'static + Sync>(name: &'static str,
+         cron_expression: &'static str,
          callback: &mut Box<TimerCallback>,
-         after_execute: &mut F){
+         after_execute: &mut Func){
             let _ = other_thread::scope(|scope| {
                 let (_sender, _receiver) = channel::<Duration>();
                 let _sender = Arc::new(Mutex::new(_sender));
@@ -195,7 +198,6 @@ impl JobTimer<'static>{
                     loop {
                         if let Ok(_) = rx.recv() {
                             let start = Local::now();
-                            
                             callback();
     
                             if let Ok(mutex) = clone.lock(){
@@ -244,7 +246,7 @@ impl JobScheduler<'static>{
         Self{
             _timers: Dict::<Mutex<Box<JobTimer>>>::new(),
             _handles: vec![],
-            _executions: Vec::<Box<dyn IExecutionResult<()> + 'static + Send + Sync>>::new()
+            _executions: vec![]
         }
     }
 
@@ -341,7 +343,24 @@ impl JobScheduler<'static>{
 
 impl ScheduleManager{
     pub fn instance() -> JobScheduler<'static> {
-        JobScheduler::new()
+        let mut scheduler = JobScheduler::new();
+        let _ = ScheduleManager::init(&mut scheduler);
+
+        scheduler
+    }
+
+    fn init(_scheduler: &mut JobScheduler) -> Result<(), Box<dyn Error>>{
+        let mut config = Ini::new();
+        let map = config.load("jobs.ini")?;
+        let innermap = map["Jobs"].clone();
+
+        println!("Here");
+
+        for (key, value) in innermap {
+            println!("{} {}", key, value.unwrap());
+        }
+
+        Ok(())
     }
 }
 
@@ -395,13 +414,12 @@ mod tests {
         let mut scheduler = ScheduleManager::instance();
         let mut test = TestCall::new();
 
-        let callback = |_| {
-            println!("Callback executed");
+        let callback = move |_| {
+            assert_eq!(test.increment(), 1);
         };
 
         let _job1 = scheduler.schedule_with_callback("test", "*/1 * * * *", move || { }, Some(callback));
         let _job2 = scheduler.execute(move || {
-            println!("Executed!");
             assert_eq!(test.increment(), 1);
         });
 
