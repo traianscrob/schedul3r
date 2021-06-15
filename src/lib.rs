@@ -9,18 +9,19 @@ use crossbeam_utils::thread as other_thread;
 //types
 pub type Callback = dyn IExecutionResult<()> + Send + 'static + Sync;
 type TimerCallback = dyn FnMut() + Send + Sync + 'static;
-type ExecutionResultParam = Box<dyn IExecutionResult<()> + Send + 'static + Sync>;
 
 //traits
-pub trait Job{
+pub trait Job : Copy{
     fn execute();
 }
 
-pub trait IExecutionResult<T: ?Sized>{
+pub trait IExecutionResult<T: Sized + Copy + 'static>{
+    fn get_job_name(&self) -> String;
     fn get_start_time(&self) -> DateTime<Local>;
     fn get_run_successfuly(&self) -> Option<bool>;
     fn get_is_running(&self) -> bool;
     fn get_is_cancelling(&self) -> bool;
+    fn get_duration(&self) -> Option<Duration>;
 }
 
 //structs
@@ -34,12 +35,14 @@ pub struct JobItem{
 }
 
 pub struct JobScheduler<'a>{
-    _timers: dict::Dict<Arc<Mutex<JobTimer<'a>>>>,
-    _handles: Vec<std::thread::JoinHandle<()>>
+    _timers: Dict::<Mutex<Box<JobTimer<'a>>>>,
+    _handles: Vec<std::thread::JoinHandle<()>>,
+    _executions: Vec<Box<dyn IExecutionResult<()> + 'a + Send + Sync>>
 }
 
 #[derive(Copy)]
-pub struct ExecutionResult{
+pub struct AfterExecutionResult{
+    name: &'static str,
     start_time: DateTime<Local>,
     run_successfuly: Option<bool>,
     is_running: bool,
@@ -48,9 +51,11 @@ pub struct ExecutionResult{
 }
 
 struct JobTimer<'a>{
+    name: &'a str,
     cron_expression: &'static str,
-    callback: Box<TimerCallback>,
-    execution_result: Option<&'a dyn IExecutionResult<()>>
+    functions: Vec<Box<TimerCallback>>,
+    callbacks: Vec<Box<dyn FnMut(Box<AfterExecutionResult>) + Send + Sync>>,
+    executions: Vec<Box<dyn IExecutionResult<()> + 'a + Send + Sync>>
 }
 
 pub struct ScheduleManager{ }
@@ -103,9 +108,10 @@ impl ChronExpression{
     }
 }
 
-impl ExecutionResult{
-    pub fn new(start_time: DateTime<Local>, duration: chrono::Duration, run_successfuly: bool) -> Self{
+impl AfterExecutionResult{
+    pub fn new(name: &'static str, start_time: DateTime<Local>, duration: chrono::Duration, run_successfuly: bool) -> Self{
         Self{
+            name,
             start_time,
             run_successfuly: Some(run_successfuly),
             is_running: false,
@@ -115,7 +121,11 @@ impl ExecutionResult{
     }
 }
 
-impl IExecutionResult<()> for ExecutionResult{
+impl IExecutionResult<()> for AfterExecutionResult{
+    fn get_job_name(&self) -> String{
+        String::from(self.name)
+    }
+
     fn get_start_time(&self) -> DateTime<Local>{
         self.start_time.clone()
     }
@@ -131,27 +141,45 @@ impl IExecutionResult<()> for ExecutionResult{
     fn get_is_cancelling(&self) -> bool{
         self.is_cancelling
     }
+
+    fn get_duration(&self) -> Option<Duration>{
+        self.duration.clone()
+    }
  }
 
-impl Clone for ExecutionResult{
+impl Clone for AfterExecutionResult{
     fn clone(&self) -> Self{
         *self
     }
 }
 
-impl<'a> JobTimer<'a>{
-    pub fn new(cron_expression: &'static str, callback: Box<TimerCallback>) -> Self{
-        Self {
+impl JobTimer<'static>{
+    pub fn new(name: &'static str, cron_expression: &'static str, function: Box<TimerCallback>, callback: Option<Box<dyn FnMut(Box<AfterExecutionResult>) + Send + Sync + 'static>>) -> Self{
+        let mut obj = Self {
+            name: name,
             cron_expression: cron_expression.clone(),
-            callback: callback,
-            execution_result: None
+            functions: vec![],
+            callbacks: vec![],
+            executions: vec![]
+        };
+
+        obj.functions.push(function);
+
+        match callback {
+            Some(call) => {
+                obj.callbacks.push(call);
+            },
+            None => {}
         }
+
+        obj
     }
 
-    fn schedule<F: FnMut(ExecutionResultParam) + Send + 'static + Sync,
-                    C: FnMut() + Send + 'static + Sync>(cron_expression: &'static str, mut callback: C, after_execute: &mut F){
+    fn schedule<F: FnMut(Box<AfterExecutionResult>) + Send + 'static + Sync>(name: &'static str, cron_expression: &'static str,
+         callback: &mut Box<TimerCallback>,
+         after_execute: &mut F){
             let _ = other_thread::scope(|scope| {
-                let (_sender, _receiver) = channel::<Box<dyn IExecutionResult<()> + Send + 'static + Sync>>();
+                let (_sender, _receiver) = channel::<Duration>();
                 let _sender = Arc::new(Mutex::new(_sender));
                 let _receiver = Arc::new(Mutex::new(_receiver));
     
@@ -164,14 +192,14 @@ impl<'a> JobTimer<'a>{
                     });
     
                     let clone = _sender.clone();
-                    loop{
+                    loop {
                         if let Ok(_) = rx.recv() {
                             let start = Local::now();
-    
+                            
                             callback();
     
                             if let Ok(mutex) = clone.lock(){
-                                let _ = mutex.send(Box::new(ExecutionResult::new(Local::now(), Local::now() - start, true)));
+                                let _ = mutex.send(Local::now() - start);
                             }
                         }
                     }
@@ -182,7 +210,7 @@ impl<'a> JobTimer<'a>{
                     loop{
                         if let Ok(mutex) = clone.lock() {
                             if let Ok(work) = mutex.recv() {
-                                after_execute(work);
+                                after_execute(Box::new(AfterExecutionResult::new(name, Local::now(), work, true)));
                             }
                         }
                     }
@@ -190,16 +218,18 @@ impl<'a> JobTimer<'a>{
             });
     }
 
-    fn update_job(&mut self, data: &'a (dyn IExecutionResult<()> + 'a)){          
-        self.execution_result = Some(data);
-    }
-
     pub fn trigger(&mut self){
         let _ = other_thread::scope(|scope|{
-            let callback = Arc::new(&self.callback);
             let _ = scope.spawn(move |_| {
-                let _callback = callback.clone();
-                //callback.deref();
+                let start = Local::now();
+                self.functions[0]();
+
+                let exec_result = AfterExecutionResult::new(self.name, Local::now(), Local::now() - start, true);
+                self.executions.push(Box::new(exec_result));
+
+                if !self.callbacks.is_empty() {
+                    self.callbacks[0](Box::new(exec_result));
+                }          
             });
         });
     }
@@ -209,11 +239,12 @@ impl<'a> JobTimer<'a>{
     }
 }
 
-impl JobScheduler<'_>{
+impl JobScheduler<'static>{
     pub fn new() -> Self{
         Self{
-            _timers: Dict::<Arc<Mutex<JobTimer>>>::new(),
-            _handles: vec![]
+            _timers: Dict::<Mutex<Box<JobTimer>>>::new(),
+            _handles: vec![],
+            _executions: Vec::<Box<dyn IExecutionResult<()> + 'static + Send + Sync>>::new()
         }
     }
 
@@ -232,65 +263,79 @@ impl JobScheduler<'_>{
         vector
     }
 
-    fn private_schedule<F: FnMut() + Send + Sync + 'static + Copy,
-                        FA: FnMut(&Callback) + Send + Sync + 'static + Copy>(&mut self,
-                         name: &'static str,
-                         cron_expression: &'static str,
-                         function: F,
-                         callback: Option<FA>) -> Result<bool, String>{
-        if self._timers.contains_key(name) {
-            return Err(format!("There's already a job named: {name}!", name = name));
-        }
+    pub fn schedule<J: Job>(&mut self, cron_expression: &'static str) -> Result<bool, String>{
+        let function = || J::execute();
+        let callback = |_| {};
 
-        let handler = thread::spawn(move || {
-            JobTimer::schedule(cron_expression, function, &mut move |data: ExecutionResultParam|{
-                match callback {
-                    |None => {},
-                    |Some(mut func) => {
-                        let values: &Callback = &*data;
-                        func(values);
-                    }
-                };
-            });
-        });
-        
-        self._timers.add(String::from(name), Arc::new(Mutex::new(JobTimer::new(cron_expression, Box::new(function)))));
-        self._handles.push(handler);
-        
-        Ok(true)
+        self.private_schedule(type_name::<J>(), cron_expression, function, Some(callback))
     }
 
-    pub fn schedule<J: Job, FA: FnMut(&Callback) + Send + Sync + 'static + Copy>(&mut self, cron_expression: &'static str) -> Result<bool, String>{
-        let function = |_: &Callback|{};
-        self.private_schedule(type_name::<J>(), cron_expression, || J::execute(), Some(function))
-    }
-
-    pub fn schedule_with_callback<F: FnMut() + Send + Sync + 'static + std::marker::Copy,
-         FA: FnMut(&Callback) + Send + Sync + 'static + Copy>(&mut self,
+    pub fn schedule_with_callback<Func: FnMut() + Send + Sync + 'static + std::marker::Copy,
+         Callback: FnMut(Box<AfterExecutionResult>) + Send + Sync + 'static + Copy>(&mut self,
         name: &'static str,
         cron_expression: &'static str,
-        function: F,
-        callback: Option<FA>) -> Result<bool, String>{
+        function: Func,
+        callback: Option<Callback>) -> Result<bool, String>{
         self.private_schedule(name, cron_expression, function, callback)
     }
 
-    pub fn execute<F: FnOnce() + Send + Sync + 'static + std::marker::Copy>(&mut self, function: F){
+    pub fn execute<Func: FnOnce() + Send + Sync + 'static + std::marker::Copy>(&mut self, function: Func){
         thread::spawn(move || {
             function();
         });
     }
 
     pub fn trigger<J: Job>(&mut self){
-        let name = type_name::<J>();
+        self.private_trigger(type_name::<J>());
+    }
 
+    pub fn trigger_by_name(&mut self, name: &'static str){
+        self.private_trigger(name);
+    }
+
+    fn private_trigger(&mut self, name: &'static str){
         if self._timers.contains_key(name) {
             for elem in self._timers.iter_mut() {
                 if elem.key == String::from(name) {
                     let mut value = elem.val.lock().unwrap();
                     value.trigger();
+                    break;
                 }
             }
         }
+    }
+
+    fn private_schedule<Func: FnMut() + Send + Sync + 'static + Copy,
+                        CallbackFunc: FnMut(Box<AfterExecutionResult>) + Send + Sync + 'static + Copy>(&mut self,
+                            name: &'static str,
+                            cron_expression: &'static str,
+                            function: Func,
+                            callback: Option<CallbackFunc>) -> Result<bool, String> {
+        if self._timers.contains_key(name) {
+            return Err(format!("There's already a job named: {name}!", name = name));
+        }
+
+        let mut func: Box<TimerCallback> = Box::new(function);
+        let handler = thread::spawn(move || {
+            JobTimer::schedule(name, cron_expression, &mut func, &mut move |data: Box<AfterExecutionResult>|{
+                match callback {
+                    |None => {},
+                    |Some(mut f) => {
+                        f(data);
+                    }
+                };
+            });
+        });
+
+        let callback_func: Option<Box<dyn FnMut(Box<AfterExecutionResult>) + Send + Sync + 'static>> = match callback {
+            None => None,
+            Some(call) => Some(Box::new(call))
+        };
+        
+        self._handles.push(handler);
+        self._timers.add(String::from(name), Mutex::new(Box::new(JobTimer::new(name, cron_expression, Box::new(function), callback_func))));
+        
+        Ok(true)
     }
 }
 
@@ -302,10 +347,19 @@ impl ScheduleManager{
 
 #[cfg(test)]
 mod tests {
-    use crate::Callback;
+    use crate::Job;
     use crate::ChronExpression;
     use crate::ScheduleManager;
     use chrono::{DateTime, Local, Timelike, Datelike};
+
+    #[derive(Copy, Clone)]
+    struct MyJob{}
+
+    impl Job for MyJob{
+        fn execute() { 
+            println!("My Job executed!");
+        }
+    }
 
     #[derive(Debug, Copy, Clone, Default)]
     pub struct TestCall{
@@ -341,14 +395,19 @@ mod tests {
         let mut scheduler = ScheduleManager::instance();
         let mut test = TestCall::new();
 
-        let callback = |data: &Callback|{
-            println!("{}", data.get_start_time());
-            println!("{}", match data.get_run_successfuly(){ Some(x) => x, None => false});
+        let callback = |_| {
+            println!("Callback executed");
         };
 
         let _job1 = scheduler.schedule_with_callback("test", "*/1 * * * *", move || { }, Some(callback));
         let _job2 = scheduler.execute(move || {
+            println!("Executed!");
             assert_eq!(test.increment(), 1);
         });
+
+        let _result = scheduler.schedule::<MyJob>("*/1 * * * *");
+        scheduler.trigger::<MyJob>();
+
+        scheduler.trigger_by_name("test");
     }
 }
