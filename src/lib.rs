@@ -5,14 +5,12 @@ use std::sync::mpsc::channel;
 use std::{any::type_name, thread};
 use dict::{ Dict, DictIface };
 use crossbeam_utils::thread as other_thread;
-use configparser::ini::Ini;
-use std::error::Error;
 
 //types
 type TimerCallback = dyn FnMut() + Send + Sync + 'static;
 
 //traits
-pub trait Job : Copy{
+pub trait Job : Copy where Self: Sized{
     fn execute();
 }
 
@@ -343,24 +341,7 @@ impl JobScheduler<'static>{
 
 impl ScheduleManager{
     pub fn instance() -> JobScheduler<'static> {
-        let mut scheduler = JobScheduler::new();
-        let _ = ScheduleManager::init(&mut scheduler);
-
-        scheduler
-    }
-
-    fn init(_scheduler: &mut JobScheduler) -> Result<(), Box<dyn Error>>{
-        let mut config = Ini::new();
-        let map = config.load("jobs.ini")?;
-        let innermap = map["Jobs"].clone();
-
-        println!("Here");
-
-        for (key, value) in innermap {
-            println!("{} {}", key, value.unwrap());
-        }
-
-        Ok(())
+        JobScheduler::new()
     }
 }
 
@@ -372,11 +353,11 @@ mod tests {
     use chrono::{DateTime, Local, Timelike, Datelike};
 
     #[derive(Copy, Clone)]
-    struct MyJob{}
+    struct TestJob{}
 
-    impl Job for MyJob{
+    impl Job for TestJob{
         fn execute() { 
-            println!("My Job executed!");
+            println!("My Job executed great!");
         }
     }
 
@@ -400,16 +381,6 @@ mod tests {
     }
 
     #[test]
-    fn cron_expression_works() {
-        let cron_exp = ChronExpression::parse("13 14 * 1 6");
-        let date: DateTime<Local> = cron_exp.next();
-
-        assert_eq!(13, date.minute());
-        assert_eq!(14, date.hour());
-        assert_eq!(1, date.month());
-    }
-
-    #[test]
     fn scheduler_works() {
         let mut scheduler = ScheduleManager::instance();
         let mut test = TestCall::new();
@@ -423,9 +394,19 @@ mod tests {
             assert_eq!(test.increment(), 1);
         });
 
-        let _result = scheduler.schedule::<MyJob>("*/1 * * * *");
-        scheduler.trigger::<MyJob>();
+        let _result = scheduler.schedule::<TestJob>("*/1 * * * *");
+        scheduler.trigger::<TestJob>();
 
         scheduler.trigger_by_name("test");
+    }
+
+    #[test]
+    fn cron_expression_works() {
+        let cron_exp = ChronExpression::parse("13 14 * 1 6");
+        let date: DateTime<Local> = cron_exp.next();
+
+        assert_eq!(13, date.minute());
+        assert_eq!(14, date.hour());
+        assert_eq!(1, date.month());
     }
 }
