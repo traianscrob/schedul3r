@@ -10,7 +10,7 @@ use crossbeam_utils::thread as other_thread;
 type TimerCallback = dyn FnMut() + Send + Sync + 'static;
 
 //traits
-pub trait Job : Copy where Self: Sized{
+pub trait Job : Copy + Sized{
     fn execute();
 }
 
@@ -35,8 +35,7 @@ pub struct JobItem{
 
 pub struct JobScheduler<'a>{
     _timers: Dict::<Mutex<Box<JobTimer<'a>>>>,
-    _handles: Vec<std::thread::JoinHandle<()>>,
-    _executions: Vec<Box<dyn IExecutionResult<()> + 'a + Send + Sync>>
+    _handles: Vec<std::thread::JoinHandle<()>>
 }
 
 #[derive(Copy)]
@@ -54,7 +53,6 @@ struct JobTimer<'a>{
     cron_expression: &'static str,
     functions: Vec<Box<TimerCallback>>,
     callbacks: Vec<Box<dyn FnMut(Box<AfterExecutionResult>) + Send + Sync>>,
-    executions: Vec<Box<dyn IExecutionResult<()> + 'a + Send + Sync>>
 }
 
 pub struct ScheduleManager{ }
@@ -118,6 +116,18 @@ impl AfterExecutionResult{
             duration: Some(duration)
         }
     }
+
+    fn get_job_name(&self) -> String{
+        String::from(self.name)
+    }
+
+    fn get_duration(&self) -> Option<Duration>{
+        self.duration.clone()
+    }
+
+    fn get_run_successfuly(&self) -> Option<bool>{
+        self.run_successfuly.clone()
+    }
 }
 
 impl IExecutionResult<()> for AfterExecutionResult{
@@ -152,15 +162,33 @@ impl Clone for AfterExecutionResult{
     }
 }
 
-impl JobTimer<'static>{
+static mut EXECUTIONS: Dict<Vec<Box<AfterExecutionResult>>> = Dict::<Vec<Box<AfterExecutionResult>>>::new();
+fn add_execution(data: Box<AfterExecutionResult>){
+    let name = (*data.clone()).get_job_name();
+
+    unsafe {
+        if !EXECUTIONS.contains_key(&name) {
+            EXECUTIONS.add(name, vec![data.clone()]);
+        }
+        else {
+            for entry in EXECUTIONS.iter_mut() {
+                if entry.key == name {
+                    entry.val.push(data.clone());
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl<'a> JobTimer<'static>{
     pub fn new(name: &'static str, cron_expression: &'static str, function: Box<TimerCallback>,
         callback: Option<Box<dyn FnMut(Box<AfterExecutionResult>) + Send + Sync + 'static>>) -> Self{
         let mut obj = Self {
             name: name,
             cron_expression: cron_expression.clone(),
             functions: vec![],
-            callbacks: vec![],
-            executions: vec![]
+            callbacks: vec![]
         };
 
         obj.functions.push(function);
@@ -169,7 +197,7 @@ impl JobTimer<'static>{
             Some(call) => {
                 obj.callbacks.push(call);
             },
-            None => {}
+            _ => {}
         }
 
         obj
@@ -225,7 +253,7 @@ impl JobTimer<'static>{
                 self.functions[0]();
 
                 let exec_result = AfterExecutionResult::new(self.name, Local::now(), Local::now() - start, true);
-                self.executions.push(Box::new(exec_result));
+                add_execution(Box::new(exec_result));
 
                 if !self.callbacks.is_empty() {
                     self.callbacks[0](Box::new(exec_result));
@@ -239,12 +267,11 @@ impl JobTimer<'static>{
     }
 }
 
-impl JobScheduler<'static>{
+impl<'a> JobScheduler<'static>{
     pub fn new() -> Self{
         Self{
             _timers: Dict::<Mutex<Box<JobTimer>>>::new(),
-            _handles: vec![],
-            _executions: vec![]
+            _handles: vec![]
         }
     }
 
@@ -261,6 +288,30 @@ impl JobScheduler<'static>{
         }
 
         vector
+    }
+
+    pub fn executions<J>(&mut self) -> Option<&Vec<Box<AfterExecutionResult>>> where J:Job{
+        let job = type_name::<J>();
+
+        unsafe{
+            if EXECUTIONS.contains_key(job) {
+                let vec = &*EXECUTIONS.get(job).unwrap();
+                return Some(vec);
+            }
+        }
+
+        None
+    }
+
+    pub fn executions_by_job(&mut self, job: &'static str) -> Option<&Vec<Box<AfterExecutionResult>>>{
+        unsafe{
+            if EXECUTIONS.contains_key(job) {
+                let vec = &*EXECUTIONS.get(job).unwrap();
+                return Some(vec);
+            }
+        }
+
+        None
     }
 
     pub fn schedule<J: Job>(&mut self, cron_expression: &'static str) -> Result<bool, String>{
@@ -321,7 +372,8 @@ impl JobScheduler<'static>{
                 match callback {
                     |None => {},
                     |Some(mut f) => {
-                        f(data);
+                        f(data.clone());
+                        add_execution(data.clone());
                     }
                 };
             });
@@ -386,18 +438,34 @@ mod tests {
         let mut test = TestCall::new();
 
         let callback = move |_| {
+            println!("test executed!");
             assert_eq!(test.increment(), 1);
         };
 
-        let _job1 = scheduler.schedule_with_callback("test", "*/1 * * * *", move || { }, Some(callback));
-        let _job2 = scheduler.execute(move || {
-            assert_eq!(test.increment(), 1);
-        });
+        scheduler.execute(move || { assert_eq!(test.increment(), 1); });
+        let _ = scheduler.schedule_with_callback("test", "*/1 * * * *", move || { }, Some(callback));
+        let _ = scheduler.schedule::<TestJob>("*/1 * * * *");
 
-        let _result = scheduler.schedule::<TestJob>("*/1 * * * *");
         scheduler.trigger::<TestJob>();
-
         scheduler.trigger_by_name("test");
+
+        match scheduler.executions::<TestJob>() {
+            Some(vect) => {
+                for value in vect.iter() {
+                    println!("name: {} \n duration: {:?}", (*value).get_job_name(),  (*value).get_duration().unwrap());
+                }
+            },
+            _ => {}
+        }
+
+        match scheduler.executions_by_job("test") {
+            Some(vect) => {
+                for value in vect.iter() {
+                    println!("name: {} \n duration: {:?}", (*value).get_job_name(),  (*value).get_duration().unwrap());
+                }
+            },
+            _ => {}
+        }
     }
 
     #[test]
